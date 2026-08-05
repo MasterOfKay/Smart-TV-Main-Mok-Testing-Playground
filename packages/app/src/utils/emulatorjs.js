@@ -19,6 +19,8 @@ const CDN = 'https://cdn.emulatorjs.org/stable/data/';
 let loaderScript = null;
 // Skipp loading on second run of the game, to make it faster.
 let loadedConfig = null;
+// emulator constructor, which is only available after the core is loaded.
+let EmulatorCtor = null;
 
 // EmulatorJS cores are WebAssembly, which needs Chromium 57+. Older WebViews (webOS 4 and
 // below at Chrome 53, Tizen 4 and below at Chrome 56) lack it entirely, so games can't run
@@ -146,13 +148,16 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 			clearTimeout(timer);
 			stopWatching();
 			const reused = Boolean(loadedConfig);
-			try { loadedConfig = (window.EJS_emulator && window.EJS_emulator.config) || loadedConfig; } catch (e) { /* ignore */ }
+			try {
+				loadedConfig = (window.EJS_emulator && window.EJS_emulator.config) || loadedConfig;
+				EmulatorCtor = (window.EJS_emulator && window.EJS_emulator.constructor) || EmulatorCtor;
+			} catch (e) { /* ignore */ }
 			logGames('emulator ready', {core, ms: Date.now() - startedAt, reused});
 			resolve();
 		};
 
 		// guard for running same game twice (happedn me).
-		if (loadedConfig && typeof EmulatorJS !== 'undefined') {
+		if (loadedConfig && EmulatorCtor) {
 			try {
 				const config = Object.assign({}, loadedConfig, {
 					gameUrl,
@@ -160,7 +165,7 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 					biosUrl: biosUrl || '',
 					gameName: gameName || ''
 				});
-				window.EJS_emulator = new EmulatorJS(selector, config);
+				window.EJS_emulator = new EmulatorCtor(selector, config);
 				logGames('reusing loaded emulator scripts', {core});
 				return;
 			} catch (e) {
