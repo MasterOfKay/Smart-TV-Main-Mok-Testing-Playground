@@ -73,8 +73,8 @@ const GamePlayer = ({library, game, startFresh, onBack, backHandlerRef}) => {
 					startFresh ? Promise.resolve(null) : gamesApi.getStateBytes(game.id)
 				]);
 				if (cancelled) return;
-				const romUrl = rom.url;
-				if (rom.isBlob) blobs.current.push(romUrl);
+				const {url: romUrl, isBlob} = rom;
+				if (isBlob) blobs.current.push(romUrl);
 				let biosUrl;
 				if (game.bios && game.bios.length) {
 					biosUrl = await gamesApi.getBiosBlobUrl(libraryId, game.bios[0].id);
@@ -94,13 +94,15 @@ const GamePlayer = ({library, game, startFresh, onBack, backHandlerRef}) => {
 				if (existing) { try { ejs.loadState(existing); } catch (e) { /* ignore */ } }
 				setReady(true);
 			} catch (e) {
+				// Backing out mid-load lands here too, and that is not worth reporting.
+				if (cancelled) return;
 				serverLogger.error(serverLogger.LOG_CATEGORIES.APP, '[Games] could not start game', {
 					core: game.core,
 					system: game.system,
 					status: e.status || null,
+					totalBytes: e.totalBytes || null,
 					message: e.message || String(e)
 				}, false);
-				if (cancelled) return;
 				if (e.romTooLarge) setError($L('This game is too large to run on this TV.'));
 				else setError(e.status === 404 ? $L('Game file not found.') : $L('Could not start this game on this device.'));
 			}

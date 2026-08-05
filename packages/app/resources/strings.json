@@ -665,6 +665,7 @@
 	"This TV runs Tizen {version}. Games require Tizen 5 or newer.": "This TV runs Tizen {version}. Games require Tizen 5 or newer.",
 	"This TV runs webOS {version}. Games require webOS 5 or newer.": "This TV runs webOS {version}. Games require webOS 5 or newer.",
 	"This core has no adjustable options.": "This core has no adjustable options.",
+	"This game is too large to run on this TV.": "This game is too large to run on this TV.",
 	"Thumb": "Thumb",
 	"Timeout": "Timeout",
 	"Tizen Version": "Tizen Version",

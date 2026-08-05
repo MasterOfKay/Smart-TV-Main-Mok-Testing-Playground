@@ -1,8 +1,8 @@
-// Same-origin EmulatorJS control glue. Ports the Moonbase plugin player.html script so the
-// enact app drives EmulatorJS directly (no iframe / postMessage). Loader + WASM cores come
-// from the trusted-cert CDN (works on old webOS); the ROM/BIOS are Blob URLs the app already
-// fetched. Threads are off (no cross-origin isolation on app:// / file://), so single-threaded
-// cores only.
+// EmulatorJS control glue. Ports the Moonbase plugin player.html script so the enact app
+// drives EmulatorJS directly (no iframe / postMessage). Loader + WASM cores come from the
+// trusted-cert CDN and work on old webOS. The ROM is either a direct server URL EmulatorJS
+// streams itself or a Blob URL the app already fetched, and the BIOS is always a Blob URL.
+// Threads are off (no cross-origin isolation on app:// / file://), so single-threaded cores only.
 
 import $L from '@enact/i18n/$L';
 
@@ -17,9 +17,9 @@ const logGamesError = (message, context) =>
 const CDN = 'https://cdn.emulatorjs.org/stable/data/';
 
 let loaderScript = null;
-// Skipp loading on second run of the game, to make it faster.
+// The config loader.js built and the class it constructed. Both outlive a teardown, so a later
+// launch can build an emulator straight away instead of downloading the bundle again.
 let loadedConfig = null;
-// emulator constructor, which is only available after the core is loaded.
 let EmulatorCtor = null;
 
 // EmulatorJS cores are WebAssembly, which needs Chromium 57+. Older WebViews (webOS 4 and
@@ -73,14 +73,11 @@ export const unsupportedMessage = () => {
 // so reject after this timeout and let the caller show an error instead of hanging.
 const READY_TIMEOUT = 40000;
 
-// Shows the current status in logs
+// EmulatorJS writes what it is doing into its own status element, which is the only clue to
+// where a boot stalled once it stops making progress.
 const emulatorStatusText = () => {
-	try {
-		const emu = window.EJS_emulator;
-		return (emu && emu.textElem && emu.textElem.innerText) || null;
-	} catch (e) {
-		return null;
-	}
+	const emu = window.EJS_emulator;
+	return (emu && emu.textElem && emu.textElem.innerText) || null;
 };
 
 // Starts EmulatorJS in the element matching `selector` and resolves once the core is ready.
@@ -91,7 +88,8 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 		}
 
 		const startedAt = Date.now();
-		// If errors during boot happend log them.
+		// EmulatorJS reports a failed boot by never firing ready, so the reason only shows up as
+		// an uncaught error. Watch the window for as long as the boot runs to keep it.
 		const onWindowError = (ev) => logGamesError('window error during emulator boot', {
 			core,
 			message: ev.message || String(ev.error || ''),
@@ -108,19 +106,13 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 			window.removeEventListener('unhandledrejection', onRejection);
 		};
 
-		let shader = null;
-		try { shader = settingsJson ? JSON.parse(settingsJson).shader : null; } catch (e) { /* not JSON */ }
+		// A TV that runs out of memory mid-boot takes the app with it and never reaches the
+		// timeout below, so this line is the last thing a report will show.
 		logGames('starting emulator', {
 			core,
 			gameName,
 			bios: Boolean(biosUrl),
-			cdn: CDN,
-			// SharedArrayBuffer is only available in cross-origin isolated contexts, which the app isn't.
-			threads: false,
-			sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
-			crossOriginIsolated: typeof window.crossOriginIsolated === 'boolean' ? window.crossOriginIsolated : null,
-			// Blobs are supported on all the platforms and run bigger files for N64 and so on.
-			shader
+			blobRom: String(gameUrl || '').startsWith('blob:')
 		});
 		window.EJS_player = selector;
 		window.EJS_core = core;
@@ -134,58 +126,64 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 		// No touch screen on TV; keep the on-screen pad off.
 		window.EJS_defaultOptions = Object.assign({}, window.EJS_defaultOptions, {'virtual-gamepad': 'disabled'});
 
+		let reused = false;
 		const timer = setTimeout(() => {
 			stopWatching();
-			logGamesError('emulator never became ready', {
-				core,
-				waitedMs: READY_TIMEOUT,
-				// EmulatorJS logging its own status
-				emulatorStatus: emulatorStatusText()
-			});
+			// Whatever was cached built an emulator that never started, so drop it and let the
+			// next launch go back through the loader rather than repeat the same dead boot.
+			loadedConfig = null;
+			EmulatorCtor = null;
+			logGamesError('emulator never became ready', {reused, emulatorStatus: emulatorStatusText()});
 			reject(new Error('emulator-load-timeout'));
 		}, READY_TIMEOUT);
 		window.EJS_ready = () => {
 			clearTimeout(timer);
 			stopWatching();
-			const reused = Boolean(loadedConfig);
-			try {
-				loadedConfig = (window.EJS_emulator && window.EJS_emulator.config) || loadedConfig;
-				EmulatorCtor = (window.EJS_emulator && window.EJS_emulator.constructor) || EmulatorCtor;
-			} catch (e) { /* ignore */ }
+			loadedConfig = (window.EJS_emulator && window.EJS_emulator.config) || loadedConfig;
+			EmulatorCtor = (window.EJS_emulator && window.EJS_emulator.constructor) || EmulatorCtor;
 			logGames('emulator ready', {core, ms: Date.now() - startedAt, reused});
 			resolve();
 		};
 
-		// guard for running same game twice (happedn me).
-		if (loadedConfig && EmulatorCtor) {
+		// Once the bundle is parsed a later launch can build the emulator from the cached class
+		// instead of downloading the loader again. loader.js hooks the ready callback up itself
+		// with emulator.on('ready', ...) rather than passing it in the config, so this path has
+		// to do the same or the promise above could only ever settle by timing out.
+		if (loadedConfig && EmulatorCtor && typeof EmulatorCtor.prototype?.on === 'function') {
 			try {
 				const config = Object.assign({}, loadedConfig, {
 					gameUrl,
 					system: core,
 					biosUrl: biosUrl || '',
-					gameName: gameName || ''
+					gameName: gameName || '',
+					dataPath: CDN,
+					startOnLoad: true,
+					threads: false,
+					defaultOptions: window.EJS_defaultOptions
 				});
-				window.EJS_emulator = new EmulatorCtor(selector, config);
-				logGames('reusing loaded emulator scripts', {core});
+				const emulator = new EmulatorCtor(selector, config);
+				window.EJS_emulator = emulator;
+				window.EJS_adBlocked = (url, del) => emulator.adBlocked(url, del);
+				emulator.on('ready', window.EJS_ready);
+				reused = true;
 				return;
 			} catch (e) {
-				logGamesError('reusing loaded emulator scripts failed, falling back to loader', {
-					core,
-					message: e.message || String(e)
-				});
+				// Once the cached pair has thrown it is not worth trusting again this session.
+				loadedConfig = null;
+				EmulatorCtor = null;
+				logGamesError('could not build the emulator from the cached class', {message: e.message || String(e)});
 			}
 		}
 
-		const script = document.createElement('script');
-		script.src = CDN + 'loader.js';
-		script.onerror = () => {
+		loaderScript = document.createElement('script');
+		loaderScript.src = CDN + 'loader.js';
+		// Without this the promise sits on the full timeout when the CDN is simply unreachable.
+		loaderScript.onerror = () => {
 			clearTimeout(timer);
 			stopWatching();
-			logGamesError('loader.js failed to download', {core, url: script.src});
 			reject(new Error('emulator-loader-unreachable'));
 		};
-		loaderScript = script;
-		document.body.appendChild(script);
+		document.body.appendChild(loaderScript);
 	});
 
 const gm = () => window.EJS_emulator && window.EJS_emulator.gameManager;
@@ -257,12 +255,6 @@ export const getOptions = () => {
 
 // Tears the emulator down: stops the loop, clears the container, drops EJS globals + loader.
 export const destroyEmulator = () => {
-	// If game doesn't boot repot status
-	logGames('tearing down emulator', {
-		core: window.EJS_core || null,
-		booted: Boolean(gm()),
-		emulatorStatus: emulatorStatusText()
-	});
 	try { setPaused(true); } catch (e) { /* ignore */ }
 	try {
 		const el = document.querySelector(window.EJS_player || '#game');
@@ -273,6 +265,7 @@ export const destroyEmulator = () => {
 	}
 	loaderScript = null;
 	['EJS_emulator', 'EJS_player', 'EJS_core', 'EJS_gameUrl', 'EJS_biosUrl', 'EJS_gameName',
-		'EJS_pathtodata', 'EJS_startOnLoaded', 'EJS_threads', 'EJS_ready', 'EJS_defaultOptions']
+		'EJS_pathtodata', 'EJS_startOnLoaded', 'EJS_threads', 'EJS_ready', 'EJS_defaultOptions',
+		'EJS_adBlocked']
 		.forEach((k) => { try { delete window[k]; } catch (e) { /* ignore */ } });
 };

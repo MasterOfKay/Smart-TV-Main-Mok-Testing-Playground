@@ -80,8 +80,8 @@ const Games = ({library, onSelectGame, onHome, backHandlerRef}) => {
 	return (
 		<div className={css.root}>
 			<h1 className={css.heading}>{library?.Name || $L('Games')}</h1>
-			{/* Scrollbar to CSS makes it not selectable (smoother goinging down the list).
-			    This also made the Game Card (If the Libary was long enough), not visiable or just for a frame, and then it jumped to the scrollbar. */}
+			{/* A focusable scrollbar sits in the way once the library is long enough to scroll,
+			    taking the focus on the way down instead of letting it reach the next row. */}
 			<Scroller className={css.scroller}>
 				{rows.map((system) => {
 					const games = gamesBySystem[system.id] || [];

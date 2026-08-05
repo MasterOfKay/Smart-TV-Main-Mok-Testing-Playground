@@ -1,16 +1,15 @@
 // Client for the Moonbase plugin retro-games (EmulatorJS) endpoints under /Moonfin/Games.
 // JSON calls route through platformFetch (the webOS Let's-Encrypt TLS proxy) so metadata and
-// the settings blob work on old webOS. ROM/BIOS and the binary save state use native fetch and
-// a Blob URL (the proxy is text-only), so they inherit the same old-webOS+LE limitation as
-// video playback; cores are loaded from the trusted-cert CDN and work everywhere.
+// the settings blob work on old webOS. A ROM is served as a direct server URL carrying the
+// token in the query, which lets EmulatorJS stream the file instead of the app buffering it,
+// and falls back to a Blob URL where that request does not get through. BIOS files and the
+// binary save state always use native fetch and a Blob URL (the proxy is text-only), so they
+// inherit the same old-webOS+LE limitation as video playback. Cores load from the
+// trusted-cert CDN and work everywhere.
 
 import {getServerUrl, getAuthHeader, getApiKey, getTokenParam} from './jellyfinApi';
 import {platformFetch} from './secureFetch';
-import serverLogger from './serverLogger';
 import {fetchWithTimeout} from '../utils/fetchTimeout';
-
-const logGames = (message, context) =>
-	serverLogger.debug(serverLogger.LOG_CATEGORIES.APP, `[Games] ${message}`, context);
 
 // A stable per-user id for the global settings blob (settings are not per game).
 export const SETTINGS_ID = 'moonfin-global';
@@ -53,8 +52,31 @@ export const gameThumbUrl = (libraryId, gameId, kind = 'boxart') => {
 	return `${base()}/Moonfin/Games/${enc(libraryId)}/Thumb/${enc(gameId)}?type=${enc(kind)}${auth}`;
 };
 
-// ROM / BIOS as a same-origin Blob URL (avoids CORS; EmulatorJS fetches the blob directly).
-const blobUrl = async (path) => {
+// The largest ROM a TV will take. Buffering is what kills it, since the response, the Blob and
+// the copy EmulatorJS keeps all sit in the WebView heap at once and past this the app is killed
+// part-way through loading. Measured on a device rather than taken from a published limit, so
+// it is deliberately conservative.
+const MAX_ROM_BYTES = 48 * 1024 * 1024;
+
+const romTooLarge = (bytes) => {
+	const err = new Error('rom-too-large');
+	err.romTooLarge = true;
+	err.totalBytes = bytes;
+	return err;
+};
+
+// Drops a response once its headers have been read, so nothing is left streaming a body that
+// will never be used. Older WebViews have no res.body, hence the guard.
+const discardBody = (res) => {
+	try {
+		if (res.body && res.body.cancel) res.body.cancel();
+	} catch (e) { /* already closed */ }
+};
+
+// ROM / BIOS as a same-origin Blob URL, which avoids CORS since EmulatorJS fetches the blob
+// directly. maxBytes refuses an oversized file before it is buffered, because the failure
+// happens inside res.blob(), where the TV can take the whole app down with it.
+const blobUrl = async (path, maxBytes) => {
 	const res = await fetchWithTimeout(`${base()}/Moonfin/Games/${path}`, {
 		headers: authHeaders()
 	}, 60000);
@@ -63,60 +85,58 @@ const blobUrl = async (path) => {
 		err.status = res.status;
 		throw err;
 	}
-	// Buffering full N64 games crashes the TV. For NES games this works, but anything bigger then roghly 6mb will fail or crash.
 	const expected = Number(res.headers.get('content-length')) || null;
-	try {
-		const blob = await res.blob();
-		return URL.createObjectURL(blob);
-	} catch (e) {
-		logGames('buffering the file failed', {path, expectedBytes: expected, message: e.message || String(e)});
-		throw e;
+	if (maxBytes && expected && expected > maxBytes) {
+		discardBody(res);
+		throw romTooLarge(expected);
 	}
+	const blob = await res.blob();
+	return URL.createObjectURL(blob);
 };
 
-export const getRomBlobUrl = (libraryId, gameId) =>
-	blobUrl(`${enc(libraryId)}/Rom/${enc(gameId)}`);
+const getRomBlobUrl = (libraryId, gameId) =>
+	blobUrl(`${enc(libraryId)}/Rom/${enc(gameId)}`, MAX_ROM_BYTES);
+// A BIOS is a few hundred kilobytes at most, so there is nothing to refuse on size.
 export const getBiosBlobUrl = (libraryId, biosId) =>
 	blobUrl(`${enc(libraryId)}/Bios/${enc(biosId)}`);
 
-// Returns the direct URL for a ROM, if available.
+// The ROM endpoint takes the token in the query, which is how EmulatorJS's own XHR
+// authenticates. Null when there is no token to put there.
 const romDirectUrl = (libraryId, gameId) => {
 	const token = getApiKey();
 	if (!token) return null;
 	return `${base()}/Moonfin/Games/${enc(libraryId)}/Rom/${enc(gameId)}?${getTokenParam()}=${enc(token)}`;
 };
 
-// Probes a ROM URL to determine its size and availability.
+// Asks for the first byte only. The endpoint streams with range processing on, so a 206 comes
+// back carrying the full size in Content-Range and this costs one byte instead of the ROM.
 const probeRom = async (url) => {
 	try {
 		const res = await fetchWithTimeout(url, {headers: {Range: 'bytes=0-0'}}, 15000);
+		discardBody(res);
 		if (res.status !== 206 && !res.ok) return {ok: false, totalBytes: null};
 		const range = res.headers.get('content-range');
 		const total = range && range.split('/')[1];
-		return {ok: true, totalBytes: Number(total) || Number(res.headers.get('content-length')) || null};
+		// Content-Length on a 206 describes the one byte asked for, so it only stands in for the
+		// size when the server ignored the range and answered with the whole file.
+		const whole = res.status === 206 ? null : Number(res.headers.get('content-length'));
+		return {ok: true, totalBytes: Number(total) || whole || null};
 	} catch (e) {
 		return {ok: false, totalBytes: null};
 	}
 };
 
-// Maximum allowed size for a ROM file (48 MB). This is just a guess number from some testing. Needs better testing. anything more crashes TV
-const MAX_ROM_BYTES = 48 * 1024 * 1024;
-
-// Returns {url, isBlob} for the ROM.
+// Returns {url, isBlob} for a game's ROM. The direct URL is preferred, because EmulatorJS then
+// streams the file itself and no second copy passes through the app. The Blob URL covers the
+// platforms where a plain fetch to the server does not get through, such as old webOS behind
+// Let's Encrypt, and isBlob tells the caller whether it has a URL to revoke afterwards.
 export const getRomUrl = async (libraryId, gameId) => {
 	const direct = romDirectUrl(libraryId, gameId);
 	const probe = direct ? await probeRom(direct) : {ok: false, totalBytes: null};
-	if (probe.totalBytes && probe.totalBytes > MAX_ROM_BYTES) {
-		logGames('rom refused as too large', {gameId, totalBytes: probe.totalBytes, limit: MAX_ROM_BYTES});
-		const err = new Error('rom-too-large');
-		err.romTooLarge = true;
-		throw err;
-	}
-	if (probe.ok) {
-		logGames('serving rom by url', {gameId, totalBytes: probe.totalBytes});
-		return {url: direct, isBlob: false};
-	}
-	logGames('serving rom as blob', {gameId, reason: direct ? 'query auth refused' : 'no token'});
+	if (probe.totalBytes && probe.totalBytes > MAX_ROM_BYTES) throw romTooLarge(probe.totalBytes);
+	if (probe.ok) return {url: direct, isBlob: false};
+	// A failed probe leaves the size unknown, so getRomBlobUrl applies the same ceiling from
+	// Content-Length. Falling back must not mean skipping the check.
 	return {url: await getRomBlobUrl(libraryId, gameId), isBlob: true};
 };
 
