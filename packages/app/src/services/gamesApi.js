@@ -6,7 +6,11 @@
 
 import {getServerUrl, getAuthHeader, getApiKey, getTokenParam} from './jellyfinApi';
 import {platformFetch} from './secureFetch';
+import serverLogger from './serverLogger';
 import {fetchWithTimeout} from '../utils/fetchTimeout';
+
+const logGames = (message, context) =>
+	serverLogger.debug(serverLogger.LOG_CATEGORIES.APP, `[Games] ${message}`, context);
 
 // A stable per-user id for the global settings blob (settings are not per game).
 export const SETTINGS_ID = 'moonfin-global';
@@ -59,14 +63,62 @@ const blobUrl = async (path) => {
 		err.status = res.status;
 		throw err;
 	}
-	const blob = await res.blob();
-	return URL.createObjectURL(blob);
+	// Buffering full N64 games crashes the TV. For NES games this works, but anything bigger then roghly 6mb will fail or crash.
+	const expected = Number(res.headers.get('content-length')) || null;
+	try {
+		const blob = await res.blob();
+		return URL.createObjectURL(blob);
+	} catch (e) {
+		logGames('buffering the file failed', {path, expectedBytes: expected, message: e.message || String(e)});
+		throw e;
+	}
 };
 
 export const getRomBlobUrl = (libraryId, gameId) =>
 	blobUrl(`${enc(libraryId)}/Rom/${enc(gameId)}`);
 export const getBiosBlobUrl = (libraryId, biosId) =>
 	blobUrl(`${enc(libraryId)}/Bios/${enc(biosId)}`);
+
+// Returns the direct URL for a ROM, if available.
+const romDirectUrl = (libraryId, gameId) => {
+	const token = getApiKey();
+	if (!token) return null;
+	return `${base()}/Moonfin/Games/${enc(libraryId)}/Rom/${enc(gameId)}?${getTokenParam()}=${enc(token)}`;
+};
+
+// Probes a ROM URL to determine its size and availability.
+const probeRom = async (url) => {
+	try {
+		const res = await fetchWithTimeout(url, {headers: {Range: 'bytes=0-0'}}, 15000);
+		if (res.status !== 206 && !res.ok) return {ok: false, totalBytes: null};
+		const range = res.headers.get('content-range');
+		const total = range && range.split('/')[1];
+		return {ok: true, totalBytes: Number(total) || Number(res.headers.get('content-length')) || null};
+	} catch (e) {
+		return {ok: false, totalBytes: null};
+	}
+};
+
+// Maximum allowed size for a ROM file (48 MB). This is just a guess number from some testing. Needs better testing. anything more crashes TV
+const MAX_ROM_BYTES = 48 * 1024 * 1024;
+
+// Returns {url, isBlob} for the ROM.
+export const getRomUrl = async (libraryId, gameId) => {
+	const direct = romDirectUrl(libraryId, gameId);
+	const probe = direct ? await probeRom(direct) : {ok: false, totalBytes: null};
+	if (probe.totalBytes && probe.totalBytes > MAX_ROM_BYTES) {
+		logGames('rom refused as too large', {gameId, totalBytes: probe.totalBytes, limit: MAX_ROM_BYTES});
+		const err = new Error('rom-too-large');
+		err.romTooLarge = true;
+		throw err;
+	}
+	if (probe.ok) {
+		logGames('serving rom by url', {gameId, totalBytes: probe.totalBytes});
+		return {url: direct, isBlob: false};
+	}
+	logGames('serving rom as blob', {gameId, reason: direct ? 'query auth refused' : 'no token'});
+	return {url: await getRomBlobUrl(libraryId, gameId), isBlob: true};
+};
 
 // Save state (binary) keyed per game. Returns null when none exists (404).
 export const getStateBytes = async (gameId) => {

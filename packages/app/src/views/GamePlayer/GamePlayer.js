@@ -7,6 +7,7 @@ import SpotlightContainerDecorator from '@enact/spotlight/SpotlightContainerDeco
 import AdminMessageDialog from '../../components/AdminMessageDialog';
 import LoadingSpinner from '../../components/LoadingSpinner';
 import * as gamesApi from '../../services/gamesApi';
+import serverLogger from '../../services/serverLogger';
 import {initVideo, keepScreenOn, setupVisibilityHandler} from '../../services/video';
 import * as ejs from '../../utils/emulatorjs';
 
@@ -66,13 +67,14 @@ const GamePlayer = ({library, game, startFresh, onBack, backHandlerRef}) => {
 		const libraryId = library?.Id;
 		(async () => {
 			try {
-				const [romUrl, settingsJson, existing] = await Promise.all([
-					gamesApi.getRomBlobUrl(libraryId, game.id),
+				const [rom, settingsJson, existing] = await Promise.all([
+					gamesApi.getRomUrl(libraryId, game.id),
 					gamesApi.getSettingsBlob(),
 					startFresh ? Promise.resolve(null) : gamesApi.getStateBytes(game.id)
 				]);
 				if (cancelled) return;
-				blobs.current.push(romUrl);
+				const romUrl = rom.url;
+				if (rom.isBlob) blobs.current.push(romUrl);
 				let biosUrl;
 				if (game.bios && game.bios.length) {
 					biosUrl = await gamesApi.getBiosBlobUrl(libraryId, game.bios[0].id);
@@ -92,7 +94,15 @@ const GamePlayer = ({library, game, startFresh, onBack, backHandlerRef}) => {
 				if (existing) { try { ejs.loadState(existing); } catch (e) { /* ignore */ } }
 				setReady(true);
 			} catch (e) {
-				if (!cancelled) setError(e.status === 404 ? $L('Game file not found.') : $L('Could not start this game on this device.'));
+				serverLogger.error(serverLogger.LOG_CATEGORIES.APP, '[Games] could not start game', {
+					core: game.core,
+					system: game.system,
+					status: e.status || null,
+					message: e.message || String(e)
+				}, false);
+				if (cancelled) return;
+				if (e.romTooLarge) setError($L('This game is too large to run on this TV.'));
+				else setError(e.status === 404 ? $L('Game file not found.') : $L('Could not start this game on this device.'));
 			}
 		})();
 		return () => {

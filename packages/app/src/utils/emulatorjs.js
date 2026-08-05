@@ -6,11 +6,19 @@
 
 import $L from '@enact/i18n/$L';
 
+import serverLogger from '../services/serverLogger';
 import {isWebOS, isTizen} from '../platform';
+
+const logGames = (message, context) =>
+	serverLogger.debug(serverLogger.LOG_CATEGORIES.APP, `[Games] ${message}`, context);
+const logGamesError = (message, context) =>
+	serverLogger.error(serverLogger.LOG_CATEGORIES.APP, `[Games] ${message}`, context, false);
 
 const CDN = 'https://cdn.emulatorjs.org/stable/data/';
 
 let loaderScript = null;
+// Skipp loading on second run of the game, to make it faster.
+let loadedConfig = null;
 
 // EmulatorJS cores are WebAssembly, which needs Chromium 57+. Older WebViews (webOS 4 and
 // below at Chrome 53, Tizen 4 and below at Chrome 56) lack it entirely, so games can't run
@@ -63,12 +71,55 @@ export const unsupportedMessage = () => {
 // so reject after this timeout and let the caller show an error instead of hanging.
 const READY_TIMEOUT = 40000;
 
+// Shows the current status in logs
+const emulatorStatusText = () => {
+	try {
+		const emu = window.EJS_emulator;
+		return (emu && emu.textElem && emu.textElem.innerText) || null;
+	} catch (e) {
+		return null;
+	}
+};
+
 // Starts EmulatorJS in the element matching `selector` and resolves once the core is ready.
 export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, settingsJson}) =>
 	new Promise((resolve, reject) => {
 		if (settingsJson) {
 			try { window.localStorage.setItem('ejs-settings', settingsJson); } catch (e) { /* ignore */ }
 		}
+
+		const startedAt = Date.now();
+		// If errors during boot happend log them.
+		const onWindowError = (ev) => logGamesError('window error during emulator boot', {
+			core,
+			message: ev.message || String(ev.error || ''),
+			source: ev.filename ? `${ev.filename}:${ev.lineno}` : null
+		});
+		const onRejection = (ev) => logGamesError('unhandled rejection during emulator boot', {
+			core,
+			reason: String((ev.reason && (ev.reason.message || ev.reason)) || '')
+		});
+		window.addEventListener('error', onWindowError);
+		window.addEventListener('unhandledrejection', onRejection);
+		const stopWatching = () => {
+			window.removeEventListener('error', onWindowError);
+			window.removeEventListener('unhandledrejection', onRejection);
+		};
+
+		let shader = null;
+		try { shader = settingsJson ? JSON.parse(settingsJson).shader : null; } catch (e) { /* not JSON */ }
+		logGames('starting emulator', {
+			core,
+			gameName,
+			bios: Boolean(biosUrl),
+			cdn: CDN,
+			// SharedArrayBuffer is only available in cross-origin isolated contexts, which the app isn't.
+			threads: false,
+			sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+			crossOriginIsolated: typeof window.crossOriginIsolated === 'boolean' ? window.crossOriginIsolated : null,
+			// Blobs are supported on all the platforms and run bigger files for N64 and so on.
+			shader
+		});
 		window.EJS_player = selector;
 		window.EJS_core = core;
 		window.EJS_gameUrl = gameUrl;
@@ -81,12 +132,55 @@ export const startEmulator = ({selector, core, gameUrl, biosUrl, gameName, setti
 		// No touch screen on TV; keep the on-screen pad off.
 		window.EJS_defaultOptions = Object.assign({}, window.EJS_defaultOptions, {'virtual-gamepad': 'disabled'});
 
-		const timer = setTimeout(() => reject(new Error('emulator-load-timeout')), READY_TIMEOUT);
-		window.EJS_ready = () => { clearTimeout(timer); resolve(); };
+		const timer = setTimeout(() => {
+			stopWatching();
+			logGamesError('emulator never became ready', {
+				core,
+				waitedMs: READY_TIMEOUT,
+				// EmulatorJS logging its own status
+				emulatorStatus: emulatorStatusText()
+			});
+			reject(new Error('emulator-load-timeout'));
+		}, READY_TIMEOUT);
+		window.EJS_ready = () => {
+			clearTimeout(timer);
+			stopWatching();
+			const reused = Boolean(loadedConfig);
+			try { loadedConfig = (window.EJS_emulator && window.EJS_emulator.config) || loadedConfig; } catch (e) { /* ignore */ }
+			logGames('emulator ready', {core, ms: Date.now() - startedAt, reused});
+			resolve();
+		};
 
-		loaderScript = document.createElement('script');
-		loaderScript.src = CDN + 'loader.js';
-		document.body.appendChild(loaderScript);
+		// guard for running same game twice (happedn me).
+		if (loadedConfig && typeof EmulatorJS !== 'undefined') {
+			try {
+				const config = Object.assign({}, loadedConfig, {
+					gameUrl,
+					system: core,
+					biosUrl: biosUrl || '',
+					gameName: gameName || ''
+				});
+				window.EJS_emulator = new EmulatorJS(selector, config);
+				logGames('reusing loaded emulator scripts', {core});
+				return;
+			} catch (e) {
+				logGamesError('reusing loaded emulator scripts failed, falling back to loader', {
+					core,
+					message: e.message || String(e)
+				});
+			}
+		}
+
+		const script = document.createElement('script');
+		script.src = CDN + 'loader.js';
+		script.onerror = () => {
+			clearTimeout(timer);
+			stopWatching();
+			logGamesError('loader.js failed to download', {core, url: script.src});
+			reject(new Error('emulator-loader-unreachable'));
+		};
+		loaderScript = script;
+		document.body.appendChild(script);
 	});
 
 const gm = () => window.EJS_emulator && window.EJS_emulator.gameManager;
@@ -158,6 +252,12 @@ export const getOptions = () => {
 
 // Tears the emulator down: stops the loop, clears the container, drops EJS globals + loader.
 export const destroyEmulator = () => {
+	// If game doesn't boot repot status
+	logGames('tearing down emulator', {
+		core: window.EJS_core || null,
+		booted: Boolean(gm()),
+		emulatorStatus: emulatorStatusText()
+	});
 	try { setPaused(true); } catch (e) { /* ignore */ }
 	try {
 		const el = document.querySelector(window.EJS_player || '#game');
